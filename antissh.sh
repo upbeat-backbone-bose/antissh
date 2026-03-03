@@ -104,6 +104,49 @@ echo ""
 return 1
 }
 
+# 函数名：extract_version_from_language_server_path
+# 功能：从 language_server 路径中提取版本号
+# 参数：$1 - language_server 文件路径
+# 返回：0 成功（输出版本号）/ 1 失败（输出空）
+extract_version_from_language_server_path() {
+local path="$1"
+local version_dir version
+version_dir=$(echo "${path}" | sed -n 's|.*/bin/\([^/]*\)/extensions/antigravity/bin/.*|\1|p')
+[ -z "${version_dir}" ] && return 1
+
+version="${version_dir%-*}"
+[ -z "${version}" ] && version="${version_dir}"
+
+if [[ "${version}" =~ ^[0-9]+([.][0-9]+)*([-.][0-9A-Za-z]+)*$ ]]; then
+echo "${version}"
+return 0
+fi
+return 1
+}
+
+# 函数名：choose_best_language_server_candidate
+# 功能：按版本号优先、mtime 次优先选择 language_server 路径
+# 参数：$@ - 候选路径列表
+# 返回：0 成功（输出选中的路径）/ 1 失败（输出空）
+choose_best_language_server_candidate() {
+if [ "$#" -eq 0 ]; then
+return 1
+fi
+
+local path version mtime has_version
+for path in "$@"; do
+version=""
+has_version=0
+if version="$(extract_version_from_language_server_path "${path}" 2>/dev/null)"; then
+has_version=1
+else
+version="0.0.0"
+fi
+mtime="$(get_file_mtime "${path}" 2>/dev/null || echo 0)"
+printf '%s\t%s\t%s\t%s\n' "${has_version}" "${version}" "${mtime}" "${path}"
+done | sort -t $'\t' -k1,1n -k2,2V -k3,3n | tail -n 1 | cut -f4-
+}
+
 # 函数名：format_date_from_epoch
 # 功能：将 epoch 时间戳格式化为人类可读日期
 # 参数：$1 - epoch 时间戳
@@ -1448,13 +1491,9 @@ fi
         TARGET_BIN="${user_candidates[0]}"
         log "选择当前用户的 Agent 服务：${TARGET_BIN}"
       else
-        # 多个当前用户的文件，按修改时间选择最新的
-        log "当前用户有多个版本，选择最新版本..."
-        TARGET_BIN=$(
-          for p in "${user_candidates[@]}"; do
-            printf '%s %s\n' "$(get_file_mtime "${p}" 2>/dev/null || echo 0)" "${p}"
-          done | sort -rn | head -n 1 | cut -d' ' -f2-
-        )
+        # 多个当前用户的文件：优先按版本号选择，mtime 作为同版本兜底
+        log "当前用户有多个版本，按版本号优先选择最新版本..."
+        TARGET_BIN="$(choose_best_language_server_candidate "${user_candidates[@]}")"
         log "已选择最新版本：${TARGET_BIN}"
       fi
     else
@@ -1481,11 +1520,7 @@ fi
       fi
 
       # 选择有权限的最新文件
-      TARGET_BIN=$(
-        for p in "${accessible_candidates[@]}"; do
-          printf '%s %s\n' "$(get_file_mtime "${p}" 2>/dev/null || echo 0)" "${p}"
-        done | sort -rn | head -n 1 | cut -d' ' -f2-
-      )
+      TARGET_BIN="$(choose_best_language_server_candidate "${accessible_candidates[@]}")"
 
       warn "将使用其他用户的文件（请确认这是您期望的行为）：${TARGET_BIN}"
     fi
@@ -1659,6 +1694,70 @@ error "wrapper 写入失败：无法移动临时文件到 ${TARGET_BIN}"
 fi
 
 log "已生成代理 wrapper：${TARGET_BIN}"
+}
+
+################################ 清理残留 language_server 进程 ################################
+
+# 函数名：cleanup_stale_language_servers
+# 功能：清理当前用户残留的 language_server 进程，避免复用旧进程
+cleanup_stale_language_servers() {
+local PROCESS_PATTERN="extensions/antigravity/bin/language_server_"
+local MAX_WAIT_ROUNDS=6
+local WAIT_INTERVAL_SECONDS="0.5"
+local WAIT_FALLBACK_SECONDS=1
+local current_user pid user cmd wait_count has_alive
+local stale_pids=()
+
+if ! command -v ps >/dev/null 2>&1; then
+warn "未找到 ps 命令，跳过残留 language_server 进程清理。"
+return 0
+fi
+
+current_user="$(whoami)"
+log "检查残留 language_server 进程..."
+
+while IFS= read -r pid user cmd; do
+[ -z "${pid}" ] && continue
+case "${cmd}" in
+*"${PROCESS_PATTERN}"*)
+[ "${user}" = "${current_user}" ] || continue
+stale_pids+=("${pid}")
+log "发现残留进程：PID=${pid} 用户=${user} 命令=${cmd}"
+;;
+esac
+done < <(ps -eo pid=,user=,args= 2>/dev/null)
+
+if [ "${#stale_pids[@]}" -eq 0 ]; then
+log "未发现当前用户的残留 language_server 进程。"
+return 0
+fi
+
+for pid in "${stale_pids[@]}"; do
+kill "${pid}" 2>/dev/null || warn "发送 SIGTERM 失败：PID=${pid}"
+done
+
+wait_count=0
+while [ "${wait_count}" -lt "${MAX_WAIT_ROUNDS}" ]; do
+has_alive="false"
+for pid in "${stale_pids[@]}"; do
+if kill -0 "${pid}" 2>/dev/null; then
+has_alive="true"
+break
+fi
+done
+[ "${has_alive}" = "false" ] && break
+sleep "${WAIT_INTERVAL_SECONDS}" 2>/dev/null || sleep "${WAIT_FALLBACK_SECONDS}"
+wait_count=$((wait_count + 1))
+done
+
+for pid in "${stale_pids[@]}"; do
+if kill -0 "${pid}" 2>/dev/null; then
+warn "进程未退出，发送 SIGKILL：PID=${pid}"
+kill -9 "${pid}" 2>/dev/null || warn "发送 SIGKILL 失败：PID=${pid}"
+fi
+done
+
+log "已清理 ${#stale_pids[@]} 个残留 language_server 进程。"
 }
 
 ################################ 测试代理连通性 ################################
@@ -1921,6 +2020,7 @@ main() {
   install_graftcp
   find_language_server
   setup_wrapper
+  cleanup_stale_language_servers
   test_proxy
 
   echo
